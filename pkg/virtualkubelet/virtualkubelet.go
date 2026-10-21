@@ -971,16 +971,19 @@ func (p *Provider) createShadowPod(ctx context.Context, originalPod *v1.Pod) (*v
 		return nil, nil, fmt.Errorf("pod namespace is empty")
 	}
 
-	identity, err := computeShadowResourceIdentity(originalPod)
+	identity, err := p.shadowResourceIdentity(originalPod)
 	if err != nil {
 		return nil, nil, err
 	}
-	if isShadowSameNamespace(originalPod) {
+	if p.shadowInPodNamespace(originalPod) {
 		log.G(ctx).Infof("Request from outside configuration detected. Using original pod namespace: %s", identity.Namespace)
 	}
 	log.G(ctx).Infof("Computed resource names - base: %s, namespace: %s", identity.Name, identity.Namespace)
 
-	_, err = p.clientSet.CoreV1().Namespaces().Get(ctx, identity.Namespace, metav1.GetOptions{})
+	// The pod's own namespace exists; only a separate shadow namespace may need creating.
+	if identity.Namespace != originalPod.Namespace {
+		_, err = p.clientSet.CoreV1().Namespaces().Get(ctx, identity.Namespace, metav1.GetOptions{})
+	}
 	if err != nil {
 		if !apierrors.IsNotFound(err) {
 			return nil, nil, fmt.Errorf("failed to get shadow namespace %s: %w", identity.Namespace, err)
@@ -1841,7 +1844,7 @@ func isMeshNetworkingDisabled(pod *v1.Pod) bool {
 
 // handleShadowCreation creates shadow infrastructure and returns the pod IP
 func (p *Provider) handleShadowCreation(ctx context.Context, pod *v1.Pod) (string, error) {
-	identity, err := computeShadowResourceIdentity(pod)
+	identity, err := p.shadowResourceIdentity(pod)
 	if err != nil {
 		return "", err
 	}
@@ -1966,7 +1969,7 @@ func (p *Provider) handleRemoteExecutionFailure(ctx context.Context, pod *v1.Pod
 // It returns the assigned IP.  When earlyReturn is true the caller should return nil
 // immediately (mirroring the original behaviour when listing pods fails).
 func (p *Provider) setupVPNPodIP(ctx context.Context, pod *v1.Pod) (ip string, earlyReturn bool, err error) {
-	podsVPN, listErr := p.clientSet.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	podsVPN, listErr := p.clientSet.CoreV1().Pods(p.config.TenantNamespace).List(ctx, metav1.ListOptions{})
 	if listErr != nil {
 		log.G(ctx).Warning("Get all pods attached to the VPN")
 		return "", true, nil
@@ -2049,6 +2052,9 @@ func (p *Provider) setPodInitialStatus(ctx context.Context, pod *v1.Pod, podIP s
 func (p *Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	TracerUpdate(&ctx, "CreatePodVK", pod)
 
+	if err := p.checkTenantNamespace(pod); err != nil {
+		return err
+	}
 	if err := p.checkSocketPortsRequest(pod); err != nil {
 		return err
 	}
@@ -2168,7 +2174,7 @@ func (p *Provider) DeletePod(ctx context.Context, pod *v1.Pod) (err error) {
 	// Clean up shadow resources if tunnel is enabled and they exist and no VPN annotation
 	if p.hasShadow(pod) {
 		if _, released := p.shadowsReleased.LoadAndDelete(string(pod.UID)); !released {
-			identity, identityErr := computeShadowResourceIdentity(pod)
+			identity, identityErr := p.shadowResourceIdentity(pod)
 			if identityErr != nil {
 				log.G(ctx).Warningf("Failed to compute shadow resource identity for %s/%s: %v", pod.Namespace, pod.Name, identityErr)
 			} else {
@@ -2484,7 +2490,7 @@ func (p *Provider) statusLoop(ctx context.Context) {
 
 		p.podIPs = []string{}
 
-		podsVPN, err := p.clientSet.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+		podsVPN, err := p.clientSet.CoreV1().Pods(p.config.TenantNamespace).List(ctx, metav1.ListOptions{})
 		if err != nil {
 			log.G(ctx).Error(err)
 		}
@@ -2699,10 +2705,14 @@ func (p *Provider) RetrievePodsFromCluster(ctx context.Context) error {
 
 	log.G(ctx).Info("Retrieving ALL Pods registered to the cluster and owned by VK")
 
-	namespaces, err := p.clientSet.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		log.G(ctx).Error("Unable to retrieve all namespaces available in the cluster")
-		return err
+	var err error
+	namespaces := &v1.NamespaceList{Items: []v1.Namespace{{ObjectMeta: metav1.ObjectMeta{Name: p.config.TenantNamespace}}}}
+	if p.config.TenantNamespace == "" {
+		namespaces, err = p.clientSet.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
+		if err != nil {
+			log.G(ctx).Error("Unable to retrieve all namespaces available in the cluster")
+			return err
+		}
 	}
 
 	for _, ns := range namespaces.Items {

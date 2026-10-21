@@ -86,7 +86,8 @@ func NormalizeShadowConfig(config *Config) error {
 		return fmt.Errorf("invalid Network.SSH.NodeWaitTimeout %q: %w", s.NodeWaitTimeout, err)
 	}
 	if s.ReplicateCredentials == nil {
-		replicate := true
+		// A virtual node confined to one namespace expects the credential there already.
+		replicate := config.TenantNamespace == ""
 		s.ReplicateCredentials = &replicate
 	}
 

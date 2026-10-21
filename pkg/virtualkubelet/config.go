@@ -25,6 +25,11 @@ type Config struct {
 	ServiceAccount string `yaml:"ServiceAccount"`
 	// Namespace specifies the Kubernetes namespace in which the Virtual Kubelet operates
 	Namespace string `yaml:"Namespace"`
+	// TenantNamespace, when set, confines the virtual node to the pods of this one namespace:
+	// pods from any other namespace are refused, shadows are created in it, and the virtual
+	// kubelet watches and lists pods, Secrets, ConfigMaps and Services only there, so its RBAC
+	// can be a Role in that namespace instead of cluster-wide read access.
+	TenantNamespace string `yaml:"TenantNamespace,omitempty"`
 	// PodIP is the IP address assigned to the virtual node
 	PodIP string `yaml:"PodIP"`
 	// PodCIDR defines the CIDR range for pods assigned to the virtual node

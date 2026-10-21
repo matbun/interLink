@@ -162,7 +162,21 @@ func isShadowSameNamespace(pod *v1.Pod) bool {
 	return pod.Annotations["interlink.eu/shadow-same-ns"] == valueTrue
 }
 
+// shadowInPodNamespace reports whether the pod's shadow lives in the pod's own namespace:
+// asked for by the pod, or always on a virtual node confined to one namespace.
+func (p *Provider) shadowInPodNamespace(pod *v1.Pod) bool {
+	return p.config.TenantNamespace != "" || isShadowSameNamespace(pod)
+}
+
+func (p *Provider) shadowResourceIdentity(pod *v1.Pod) (shadowResourceIdentity, error) {
+	return shadowResourceIdentityFor(pod, p.shadowInPodNamespace(pod))
+}
+
 func computeShadowResourceIdentity(pod *v1.Pod) (shadowResourceIdentity, error) {
+	return shadowResourceIdentityFor(pod, isShadowSameNamespace(pod))
+}
+
+func shadowResourceIdentityFor(pod *v1.Pod, sameNamespace bool) (shadowResourceIdentity, error) {
 	if pod == nil {
 		return shadowResourceIdentity{}, fmt.Errorf("pod is nil")
 	}
@@ -171,7 +185,7 @@ func computeShadowResourceIdentity(pod *v1.Pod) (shadowResourceIdentity, error) 
 	}
 
 	var name, namespace string
-	if isShadowSameNamespace(pod) {
+	if sameNamespace {
 		name, namespace = computeShadowResourceNamesForSameNamespace(pod.Name, pod.Namespace)
 	} else {
 		name, namespace = computeShadowResourceNames(pod.Name, pod.Namespace)
@@ -349,7 +363,7 @@ func (p *Provider) publishShadowNode(ctx context.Context, pod *v1.Pod, nodeName,
 		return
 	}
 
-	identity, err := computeShadowResourceIdentity(pod)
+	identity, err := p.shadowResourceIdentity(pod)
 	if err != nil {
 		log.G(ctx).Warningf("Failed to compute shadow resource identity for %s/%s: %v", pod.Namespace, pod.Name, err)
 		return
@@ -392,7 +406,7 @@ func (p *Provider) releaseShadowOfEndedPod(ctx context.Context, pod *v1.Pod) {
 	if _, done := p.shadowsReleased.LoadOrStore(string(pod.UID), true); done {
 		return
 	}
-	identity, err := computeShadowResourceIdentity(pod)
+	identity, err := p.shadowResourceIdentity(pod)
 	if err != nil {
 		log.G(ctx).Warningf("Failed to compute shadow resource identity for %s/%s: %v", pod.Namespace, pod.Name, err)
 		return

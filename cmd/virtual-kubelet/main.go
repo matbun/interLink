@@ -421,21 +421,25 @@ func setupKubernetesClient(ctx context.Context) (*rest.Config, *kubernetes.Clien
 }
 
 // setupInformers creates and starts the Kubernetes informers
-func setupInformers(ctx context.Context, localClient *kubernetes.Clientset, nodeName string) (informers.SharedInformerFactory, informers.SharedInformerFactory, chan struct{}) {
+func setupInformers(ctx context.Context, localClient *kubernetes.Clientset, nodeName, tenantNamespace string) (informers.SharedInformerFactory, informers.SharedInformerFactory, chan struct{}) {
 	resync, err := time.ParseDuration("30s")
 	if err != nil {
 		log.G(ctx).Fatal(err)
 	}
 
+	// A virtual node confined to one namespace watches nothing outside it, so its RBAC
+	// can be namespaced (informers.WithNamespace("") is the whole cluster).
 	podInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		localClient,
 		resync,
 		PodInformerFilter(nodeName),
+		informers.WithNamespace(tenantNamespace),
 	)
 
 	scmInformerFactory := informers.NewSharedInformerFactoryWithOptions(
 		localClient,
 		resync,
+		informers.WithNamespace(tenantNamespace),
 	)
 
 	// stop signal for the informer
@@ -547,7 +551,7 @@ func main() {
 	EventRecorder := eb.NewRecorder(scheme.Scheme, v1.EventSource{Component: path.Join(cfg.NodeName, "pod-controller")})
 	nodeProvider.SetEventRecorder(EventRecorder)
 
-	podInformerFactory, scmInformerFactory, stopper := setupInformers(ctx, localClient, cfg.NodeName)
+	podInformerFactory, scmInformerFactory, stopper := setupInformers(ctx, localClient, cfg.NodeName, interLinkConfig.TenantNamespace)
 	defer close(stopper)
 
 	podInformer := podInformerFactory.Core().V1().Pods().Informer()
