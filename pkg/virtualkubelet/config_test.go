@@ -200,6 +200,49 @@ func TestGetResources_AcceleratorQuantities(t *testing.T) {
 	assert.Equal(t, int64(1), fpgaQty.Value(), "xilinx.com/fpga should be 1")
 }
 
+// A remote site's GPUs can be offered under a resource name of their own, which a
+// namespace quota then grants separately from the cluster's own GPUs.
+func TestGetResources_OtherExtendedResources(t *testing.T) {
+	const siteGPU = "interlink.eu/site-a-h100"
+	config := Config{Resources: Resources{
+		CPU: "4", Memory: "8Gi", Pods: "100",
+		Accelerators: []Accelerator{
+			{ResourceType: siteGPU, Model: "H100", Available: "4"},
+			{ResourceType: siteGPU, Model: "H100", Available: "4"},
+		},
+	}}
+
+	q := GetResources(config)[v1.ResourceName(siteGPU)]
+	assert.Equal(t, int64(8), q.Value())
+}
+
+func TestIsExtendedResourceName(t *testing.T) {
+	for name, want := range map[string]bool{
+		"nvidia.com/gpu":           true,
+		"interlink.eu/site-a-h100": true,
+		"gpu":                      false,
+		"kubernetes.io/gpu":        false,
+		"node.kubernetes.io/gpu":   false,
+		"interlink.eu/":            false,
+		"interlink.eu/h100 x":      false,
+	} {
+		assert.Equal(t, want, isExtendedResourceName(name), name)
+	}
+}
+
+func TestLoadConfig_AcceleratorResourceType(t *testing.T) {
+	load := func(resourceType string) error {
+		path := filepath.Join(t.TempDir(), "config.yaml")
+		yaml := "Resources:\n  Accelerators:\n  - ResourceType: \"" + resourceType + "\"\n    Available: \"4\"\n"
+		require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
+		_, err := LoadConfig(t.Context(), path)
+		return err
+	}
+
+	require.NoError(t, load("interlink.eu/site-a-h100"))
+	assert.ErrorContains(t, load("h100"), "invalid accelerator resource type")
+}
+
 func TestUpdateNodeResources_CPUMemoryPods(t *testing.T) {
 	config := Config{
 		Resources: Resources{
