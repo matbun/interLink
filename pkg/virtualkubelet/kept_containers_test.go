@@ -1,11 +1,14 @@
 package virtualkubelet
 
 import (
+	"context"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -42,7 +45,7 @@ func shadowOf(t *testing.T, pod *v1.Pod, status v1.ContainerStatus) *v1.Pod {
 	return &v1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: identity.Name + "-abc", Namespace: identity.Namespace,
-			Labels: map[string]string{"app.kubernetes.io/component": identity.Name},
+			Labels: map[string]string{shadowComponentLabel: identity.Name},
 		},
 		Status: v1.PodStatus{InitContainerStatuses: []v1.ContainerStatus{status}},
 	}
@@ -138,6 +141,21 @@ func TestWaitForKeptInitContainers(t *testing.T) {
 		assert.Equal(t, keptInitName, pod.Status.InitContainerStatuses[0].Name)
 	})
 
+	t.Run("on a node confined to one namespace the shadow is in the pod's namespace", func(t *testing.T) {
+		pod := podKeepingInit(v1.RestartPolicyNever)
+		identity, err := shadowResourceIdentityFor(pod, true)
+		require.NoError(t, err)
+		shadow := shadowOf(t, pod, exited(0))
+		shadow.Name, shadow.Namespace = identity.Name+"-abc", identity.Namespace
+		shadow.Labels[shadowComponentLabel] = identity.Name
+		p := keptProvider(fake.NewSimpleClientset(shadow), pod)
+		p.config.TenantNamespace = pod.Namespace
+
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		defer cancel()
+		require.NoError(t, p.waitForKeptInitContainers(ctx, pod))
+	})
+
 	t.Run("a failure ends a restartPolicy Never pod without submitting", func(t *testing.T) {
 		pod := podKeepingInit(v1.RestartPolicyNever)
 		client := fake.NewSimpleClientset(shadowOf(t, pod, exited(2)))
@@ -224,4 +242,51 @@ func TestDropKeptOnlyVolumes(t *testing.T) {
 	}
 	assert.Equal(t, []string{dataVolume, "unused"}, names,
 		"a volume only the kept init container mounts stays on the cluster; shared and unmounted ones are sent as before")
+}
+
+func TestKeptContainerLogs(t *testing.T) {
+	keptInitPollInterval = 10 * time.Millisecond
+	t.Cleanup(func() { keptInitPollInterval = 2 * time.Second })
+
+	read := func(t *testing.T, p *Provider, pod *v1.Pod) string {
+		t.Helper()
+		rc, err := p.GetLogs(t.Context(), pod.Namespace, pod.Name, keptInitName, api.ContainerLogOpts{})
+		require.NoError(t, err)
+		defer rc.Close()
+		out, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		return string(out)
+	}
+
+	t.Run("read from the shadow while it runs, kept once it ended", func(t *testing.T) {
+		pod := podKeepingInit(v1.RestartPolicyNever)
+		shadow := shadowOf(t, pod, exited(0))
+		client := fake.NewSimpleClientset(pod, shadow)
+		p := keptProvider(client, pod)
+
+		assert.Equal(t, "fake logs", read(t, p, pod), "the fake clientset answers every log request so")
+
+		require.NoError(t, p.waitForKeptInitContainers(t.Context(), pod))
+		require.NoError(t, client.CoreV1().Pods(shadow.Namespace).Delete(t.Context(), shadow.Name, metav1.DeleteOptions{}))
+		assert.Equal(t, "fake logs", read(t, p, pod), "the shadow is gone, the saved log remains")
+	})
+
+	t.Run("no shadow and nothing saved", func(t *testing.T) {
+		pod := podKeepingInit(v1.RestartPolicyNever)
+		p := keptProvider(fake.NewSimpleClientset(pod), pod)
+		_, err := p.GetLogs(t.Context(), pod.Namespace, pod.Name, keptInitName, api.ContainerLogOpts{})
+		require.ErrorContains(t, err, "no longer exists")
+	})
+
+	t.Run("options reach the shadow's log request", func(t *testing.T) {
+		since := time.Date(2026, 10, 23, 9, 0, 0, 0, time.UTC)
+		o := shadowLogOptions(keptInitName, api.ContainerLogOpts{Tail: 5, LimitBytes: 100, SinceSeconds: 60, SinceTime: since, Follow: true})
+		assert.Equal(t, keptInitName, o.Container)
+		assert.Equal(t, int64(5), *o.TailLines)
+		assert.Equal(t, int64(100), *o.LimitBytes)
+		assert.Equal(t, int64(60), *o.SinceSeconds)
+		assert.True(t, o.SinceTime.Time.Equal(since))
+		assert.True(t, o.Follow)
+		assert.Nil(t, shadowLogOptions(keptInitName, api.ContainerLogOpts{}).TailLines)
+	})
 }

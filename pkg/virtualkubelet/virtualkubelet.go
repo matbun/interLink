@@ -203,7 +203,10 @@ type Provider struct {
 	shadowNodeNames sync.Map
 	// shadowsReleased marks, per pod UID, shadows already removed because their
 	// pod ended, so the status loop removes each one once.
-	shadowsReleased  sync.Map
+	shadowsReleased sync.Map
+	// keptInitLogs holds, per pod UID, the logs of the init containers the pod kept on
+	// the cluster (map[string][]byte by container name), read when they ended.
+	keptInitLogs     sync.Map
 	pendingDeletes   map[string]*pendingDelete
 	pendingDeletesMu sync.Mutex
 	deleteLoopOnce   sync.Once
@@ -2270,6 +2273,7 @@ func (p *Provider) deletePodRemote(ctx context.Context, pod *v1.Pod) error {
 	p.podsMu.Lock()
 	delete(p.pods, key)
 	p.podsMu.Unlock()
+	p.keptInitLogs.Delete(key)
 
 	now := metav1.Now()
 	pod.Status.Reason = "VKProviderPodDeleted"
@@ -2646,6 +2650,9 @@ func (p *Provider) GetLogs(ctx context.Context, namespace, podName, containerNam
 	pod, err := p.clientSet.CoreV1().Pods(namespace).Get(ctx, podName, metav1.GetOptions{})
 	if err != nil {
 		return nil, err
+	}
+	if isKeptContainer(pod, containerName) {
+		return p.keptContainerLogs(ctx, pod, containerName, opts)
 	}
 
 	logsRequest := types.LogStruct{

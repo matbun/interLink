@@ -33,7 +33,6 @@ const (
 	reverseTestContainer = "ssh-reverse"
 	reverseTestReady     = "rev-relay.ready"
 	reverseTestUserspace = `"%s -i -e -f %s/rev-sshd_config"`
-	shadowComponentLabel = "app.kubernetes.io/component"
 )
 
 func reverseConfig() Config {
