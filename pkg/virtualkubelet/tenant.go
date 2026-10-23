@@ -64,12 +64,14 @@ func RefuseForeignPods(ctx context.Context, client kubernetes.Interface, nodeNam
 		}))
 	informer := factory.Core().V1().Pods().Informer()
 	forbidden := false
-	_ = informer.SetWatchErrorHandler(func(_ *cache.Reflector, err error) {
+	if err := informer.SetWatchErrorHandler(func(_ *cache.Reflector, err error) {
 		if apierrors.IsForbidden(err) && !forbidden {
 			forbidden = true
 			log.G(ctx).Warningf("Cannot watch pods outside namespace %q, so pods bound to this node from other namespaces stay Pending: %v", tenant, err)
 		}
-	})
+	}); err != nil {
+		log.G(ctx).Warningf("Cannot set the error handler of the watch on pods bound to this node: %v", err)
+	}
 	handle := func(obj any) {
 		pod, ok := obj.(*v1.Pod)
 		if !ok {
@@ -79,9 +81,12 @@ func RefuseForeignPods(ctx context.Context, client kubernetes.Interface, nodeNam
 			log.G(ctx).Warningf("Could not fail refused pod %s/%s: %v", pod.Namespace, pod.Name, err)
 		}
 	}
-	_, _ = informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    handle,
 		UpdateFunc: func(_, obj any) { handle(obj) },
-	})
+	}); err != nil {
+		log.G(ctx).Warningf("Cannot refuse pods bound to this node from other namespaces: %v", err)
+		return
+	}
 	go informer.Run(ctx.Done())
 }

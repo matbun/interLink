@@ -35,6 +35,12 @@ const shadowNodeNameKey = "compute-node"
 // compute node where the pod's unix sockets live.
 const shadowSocketDirKey = "socket-dir"
 
+// shadowOfLabel carries, on the pods of a shadow, the UID of the pod the shadow
+// stands for. The shadow's name cannot tell the generations apart: a pod recreated
+// under its name, such as a StatefulSet replica, gets a shadow with the same name as
+// the previous one, whose pods may still be around.
+const shadowOfLabel = "interlink.eu/shadow-of"
+
 // maxComputeNodeNameLen is the longest DNS name, and so the longest thing a plugin
 // can legitimately report as a compute node.
 const maxComputeNodeNameLen = 253
@@ -157,6 +163,17 @@ type shadowResourceIdentity struct {
 	// after the pod, so a pod recreated under the same name reuses those names; the
 	// UID, stamped as a label, tells which pod a resource belongs to.
 	OwnerUID string
+	// PodName and PodNamespace name that pod.
+	PodName      string
+	PodNamespace string
+}
+
+// ownerPod is the namespace/name stamped as shadowOwnerPodAnnotation.
+func (identity shadowResourceIdentity) ownerPod() string {
+	if identity.PodName == "" {
+		return ""
+	}
+	return identity.PodNamespace + "/" + identity.PodName
 }
 
 func isShadowSameNamespace(pod *v1.Pod) bool {
@@ -195,7 +212,10 @@ func shadowResourceIdentityFor(pod *v1.Pod, sameNamespace bool) (shadowResourceI
 		name, namespace = computeShadowResourceNames(pod.Name, pod.Namespace)
 	}
 
-	identity := shadowResourceIdentity{Name: name, Namespace: namespace, OwnerUID: string(pod.UID)}
+	identity := shadowResourceIdentity{
+		Name: name, Namespace: namespace,
+		OwnerUID: string(pod.UID), PodName: pod.Name, PodNamespace: pod.Namespace,
+	}
 	if len(fmt.Sprintf("%s-%s", identity.Name, identity.Namespace)) > 63 {
 		return shadowResourceIdentity{}, fmt.Errorf("shadow ingress hostname label %q exceeds 63 characters; shorten pod/namespace or disable interlink.eu/shadow-same-ns", fmt.Sprintf("%s-%s", identity.Name, identity.Namespace))
 	}
@@ -313,7 +333,9 @@ func shadowNodeConfigMapName(shadowName string) string {
 // resetShadowNodeConfigMap creates, or blanks, the per-shadow node ConfigMap.
 // The shadow is rendered before the remote batch system has allocated anything,
 // so the ConfigMap has to exist - and be mountable - while still empty. Blanking
-// an existing one stops a previous run's node from being tunnelled to.
+// an existing one stops a previous run's node from being tunnelled to. The cleanup
+// of a deleted pod with the same name can remove an existing one in between, in
+// which case it is created again.
 func (p *Provider) resetShadowNodeConfigMap(ctx context.Context, identity shadowResourceIdentity) error {
 	cm := &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
@@ -322,19 +344,25 @@ func (p *Provider) resetShadowNodeConfigMap(ctx context.Context, identity shadow
 		},
 		Data: map[string]string{shadowNodeNameKey: "", shadowSocketDirKey: ""},
 	}
-	stampShadowOwner(cm, identity.OwnerUID)
+	stampShadowOwner(cm, identity.OwnerUID, identity.ownerPod())
 
-	_, err := p.clientSet.CoreV1().ConfigMaps(identity.Namespace).Create(ctx, cm, metav1.CreateOptions{})
-	if err == nil {
-		return nil
+	configMaps := p.clientSet.CoreV1().ConfigMaps(identity.Namespace)
+	for attempt := 0; ; attempt++ {
+		_, err := configMaps.Create(ctx, cm, metav1.CreateOptions{})
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return fmt.Errorf("failed to create shadow node configmap %s/%s: %w", identity.Namespace, cm.Name, err)
+		}
+		_, err = configMaps.Update(ctx, cm, metav1.UpdateOptions{})
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsNotFound(err) || attempt == 2 {
+			return fmt.Errorf("failed to reset shadow node configmap %s/%s: %w", identity.Namespace, cm.Name, err)
+		}
 	}
-	if !apierrors.IsAlreadyExists(err) {
-		return fmt.Errorf("failed to create shadow node configmap %s/%s: %w", identity.Namespace, cm.Name, err)
-	}
-	if _, err := p.clientSet.CoreV1().ConfigMaps(identity.Namespace).Update(ctx, cm, metav1.UpdateOptions{}); err != nil {
-		return fmt.Errorf("failed to reset shadow node configmap %s/%s: %w", identity.Namespace, cm.Name, err)
-	}
-	return nil
 }
 
 // publishShadowNode records the remote compute node a pod was allocated on, and
@@ -346,7 +374,9 @@ func (p *Provider) resetShadowNodeConfigMap(ctx context.Context, identity shadow
 // patch, so the shadow never sees a new node with the previous job's directory.
 //
 // Repeated calls with unchanged values are dropped, so the status loop does not
-// write on every poll.
+// write on every poll. A ConfigMap stamped with another pod's UID belongs to a pod
+// recreated under the same name and is left alone; the patch carries the
+// resourceVersion read, so it fails rather than overwrite a change made meanwhile.
 func (p *Provider) publishShadowNode(ctx context.Context, pod *v1.Pod, nodeName, socketDir string) {
 	if nodeName == "" || !p.hasShadow(pod) {
 		return
@@ -374,19 +404,34 @@ func (p *Provider) publishShadowNode(ctx context.Context, pod *v1.Pod, nodeName,
 		return
 	}
 
-	patch, err := json.Marshal(map[string]map[string]string{"data": {
-		shadowNodeNameKey:  nodeName,
-		shadowSocketDirKey: socketDir,
-	}})
+	name := shadowNodeConfigMapName(identity.Name)
+	configMaps := p.clientSet.CoreV1().ConfigMaps(identity.Namespace)
+	current, err := configMaps.Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		log.G(ctx).Warningf("Failed to read shadow configmap %s/%s: %v", identity.Namespace, name, err)
+		return
+	}
+	if owner := current.Labels[shadowOwnerUIDLabel]; owner != "" && identity.OwnerUID != "" && owner != identity.OwnerUID {
+		log.G(ctx).Infof("Not publishing compute node %q for %s/%s: shadow configmap %s belongs to pod UID %s",
+			nodeName, pod.Namespace, pod.Name, name, owner)
+		return
+	}
+
+	var nodePatch struct {
+		Metadata struct {
+			ResourceVersion string `json:"resourceVersion"`
+		} `json:"metadata"`
+		Data map[string]string `json:"data"`
+	}
+	nodePatch.Metadata.ResourceVersion = current.ResourceVersion
+	nodePatch.Data = map[string]string{shadowNodeNameKey: nodeName, shadowSocketDirKey: socketDir}
+	patch, err := json.Marshal(nodePatch)
 	if err != nil {
 		log.G(ctx).Warningf("Failed to marshal shadow node patch for %s/%s: %v", pod.Namespace, pod.Name, err)
 		return
 	}
 
-	name := shadowNodeConfigMapName(identity.Name)
-	_, err = p.clientSet.CoreV1().ConfigMaps(identity.Namespace).Patch(
-		ctx, name, k8stypes.StrategicMergePatchType, patch, metav1.PatchOptions{},
-	)
+	_, err = configMaps.Patch(ctx, name, k8stypes.StrategicMergePatchType, patch, metav1.PatchOptions{})
 	if err != nil {
 		log.G(ctx).Warningf("Failed to publish compute node %q to shadow configmap %s/%s: %v", nodeName, identity.Namespace, name, err)
 		return
@@ -419,6 +464,145 @@ func (p *Provider) releaseShadowOfEndedPod(ctx context.Context, pod *v1.Pod) {
 	log.G(ctx).Infof("Pod %s/%s is %s: removing its shadow", pod.Namespace, pod.Name, pod.Status.Phase)
 	p.cleanupShadowResources(ctx, identity)
 	p.forgetShadowNodeName(pod)
+}
+
+// isShadowPodOf reports whether a shadow pod may serve the pod with UID podUID: it is
+// labelled for that pod, or it predates shadowOfLabel, or the UID is unknown.
+func isShadowPodOf(shadowPod *v1.Pod, podUID string) bool {
+	of := shadowPod.Labels[shadowOfLabel]
+	return of == "" || podUID == "" || of == podUID
+}
+
+// ownerIsCurrentPod reports whether the pod a shadow resource is stamped for still
+// exists: the pod named by its shadowOwnerPodAnnotation (the pod of identity when it
+// has none) has the UID of its shadowOwnerUIDLabel. The name comes from the resource
+// because two pods can share a shadow name: sanitising maps web.0 and web-0 to one.
+// Otherwise the owner is gone and its cleanup never ran (it was deleted while the
+// virtual kubelet was down, say), so its leftovers are deleted. When the pod cannot
+// be read, the resource is kept.
+func (p *Provider) ownerIsCurrentPod(ctx context.Context, identity shadowResourceIdentity, obj metav1.Object) bool {
+	namespace, name, found := strings.Cut(obj.GetAnnotations()[shadowOwnerPodAnnotation], "/")
+	if !found {
+		namespace, name = identity.PodNamespace, identity.PodName
+	}
+	if name == "" {
+		return true
+	}
+	pod, err := p.clientSet.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	if err != nil {
+		log.G(ctx).Warningf("Failed to read pod %s/%s: %v", namespace, name, err)
+		return true
+	}
+	return string(pod.UID) == obj.GetLabels()[shadowOwnerUIDLabel]
+}
+
+// indexShadowPods groups the shadow pods by the UID of the pod they stand for, read
+// from shadowOfLabel. The pods of a shadow rendered before that label existed are
+// left out, so their virtual pod keeps the IP it was created with.
+func indexShadowPods(pods []v1.Pod) map[string][]*v1.Pod {
+	index := make(map[string][]*v1.Pod)
+	for i := range pods {
+		uid := pods[i].Labels[shadowOfLabel]
+		if uid == "" {
+			continue
+		}
+		index[uid] = append(index[uid], &pods[i])
+	}
+	return index
+}
+
+// refreshShadowPodIP moves the virtual pod's IP to the pod that now runs its shadow.
+// The IP is taken from the shadow pod at creation, and that pod can be replaced at
+// any time afterwards (an eviction, a node drain, a rescheduling): the virtual pod
+// would keep reporting an address nothing answers on, and every Service selecting it
+// would keep sending traffic there. Reporting the shadow Service's ClusterIP instead
+// would break those Services: their endpoint would be a Service IP, which kube-proxy
+// does not route.
+//
+// shadowPods is the index built by indexShadowPods from the pods of the cluster.
+func (p *Provider) refreshShadowPodIP(ctx context.Context, pod *v1.Pod, shadowPods map[string][]*v1.Pod) {
+	if !p.hasTunnelShadow(pod) {
+		return
+	}
+	// These pods get their address from the VPN or from the annotation, not from the
+	// shadow (see CreatePod).
+	if _, ok := pod.Annotations["interlink.eu/pod-vpn"]; ok {
+		return
+	}
+	if _, ok := pod.Annotations["interlink.eu/pod-ip"]; ok {
+		return
+	}
+
+	p.podsMu.Lock()
+	defer p.podsMu.Unlock()
+
+	canonical, ok := p.pods[string(pod.UID)]
+	if !ok {
+		return
+	}
+	identity, err := p.shadowResourceIdentity(canonical)
+	if err != nil {
+		return
+	}
+	var candidates []*v1.Pod
+	for _, candidate := range shadowPods[string(pod.UID)] {
+		if candidate.Namespace != identity.Namespace || candidate.Labels[shadowComponentLabel] != identity.Name {
+			continue
+		}
+		candidates = append(candidates, candidate)
+	}
+	ip := currentShadowPodIP(canonical.Status.PodIP, candidates)
+	if ip == "" || ip == canonical.Status.PodIP {
+		return
+	}
+
+	log.G(ctx).Infof("Shadow pod of %s/%s replaced: moving the pod IP from %s to %s",
+		pod.Namespace, pod.Name, canonical.Status.PodIP, ip)
+	// PodPhase puts the shadow pod IP in both fields at creation. The lists follow
+	// them: the API server rejects a status whose hostIPs[0] differs from hostIP.
+	canonical.Status.PodIP = ip
+	canonical.Status.PodIPs = []v1.PodIP{{IP: ip}}
+	canonical.Status.HostIP = ip
+	canonical.Status.HostIPs = []v1.HostIP{{IP: ip}}
+}
+
+// currentShadowPodIP returns the IP a virtual pod should report among the pods of its
+// shadow, given the one it reports: that one while its pod still serves, otherwise
+// the newest serving pod's. It returns "" when none serves, so the IP only moves once
+// the replacement is ready.
+func currentShadowPodIP(reportedIP string, shadowPods []*v1.Pod) string {
+	var newest *v1.Pod
+	for _, shadowPod := range shadowPods {
+		if !isServingShadowPod(shadowPod) {
+			continue
+		}
+		if shadowPod.Status.PodIP == reportedIP {
+			return reportedIP
+		}
+		if newest == nil || newest.CreationTimestamp.Before(&shadowPod.CreationTimestamp) {
+			newest = shadowPod
+		}
+	}
+	if newest == nil {
+		return ""
+	}
+	return newest.Status.PodIP
+}
+
+// isServingShadowPod reports whether a shadow pod can take the virtual pod's traffic.
+func isServingShadowPod(pod *v1.Pod) bool {
+	if pod.DeletionTimestamp != nil || pod.Status.Phase != v1.PodRunning || pod.Status.PodIP == "" {
+		return false
+	}
+	for _, condition := range pod.Status.Conditions {
+		if condition.Type == v1.PodReady {
+			return condition.Status == v1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // forgetShadowNodeName drops the cached node and socket directory for a pod that is
