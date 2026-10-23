@@ -553,6 +553,7 @@ func main() {
 
 	podInformerFactory, scmInformerFactory, stopper := setupInformers(ctx, localClient, cfg.NodeName, interLinkConfig.TenantNamespace)
 	defer close(stopper)
+	commonIL.RefuseForeignPods(ctx, localClient, cfg.NodeName, interLinkConfig.TenantNamespace)
 
 	podInformer := podInformerFactory.Core().V1().Pods().Informer()
 	secretInformer := scmInformerFactory.Core().V1().Secrets().Informer()

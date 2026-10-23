@@ -153,6 +153,10 @@ func uniqueTruncate(s string, maxLen int, full string) string {
 type shadowResourceIdentity struct {
 	Name      string
 	Namespace string
+	// OwnerUID is the UID of the pod the shadow serves. Shadow resources are named
+	// after the pod, so a pod recreated under the same name reuses those names; the
+	// UID, stamped as a label, tells which pod a resource belongs to.
+	OwnerUID string
 }
 
 func isShadowSameNamespace(pod *v1.Pod) bool {
@@ -191,7 +195,7 @@ func shadowResourceIdentityFor(pod *v1.Pod, sameNamespace bool) (shadowResourceI
 		name, namespace = computeShadowResourceNames(pod.Name, pod.Namespace)
 	}
 
-	identity := shadowResourceIdentity{Name: name, Namespace: namespace}
+	identity := shadowResourceIdentity{Name: name, Namespace: namespace, OwnerUID: string(pod.UID)}
 	if len(fmt.Sprintf("%s-%s", identity.Name, identity.Namespace)) > 63 {
 		return shadowResourceIdentity{}, fmt.Errorf("shadow ingress hostname label %q exceeds 63 characters; shorten pod/namespace or disable interlink.eu/shadow-same-ns", fmt.Sprintf("%s-%s", identity.Name, identity.Namespace))
 	}
@@ -297,7 +301,7 @@ func computeShadowResourceNames(podName, podNamespace string) (resourceBaseName,
 // because the pod exposes ports over a tunnel or because mesh networking wraps
 // every offloaded pod.
 func (p *Provider) hasShadow(pod *v1.Pod) bool {
-	return p.shouldCreateShadow(pod) || (p.config.Network.FullMesh && !isMeshNetworkingDisabled(pod))
+	return p.hasTunnelShadow(pod) || hasKeptContainers(pod)
 }
 
 // shadowNodeConfigMapName returns the ConfigMap carrying the compute node name
@@ -318,6 +322,7 @@ func (p *Provider) resetShadowNodeConfigMap(ctx context.Context, identity shadow
 		},
 		Data: map[string]string{shadowNodeNameKey: "", shadowSocketDirKey: ""},
 	}
+	stampShadowOwner(cm, identity.OwnerUID)
 
 	_, err := p.clientSet.CoreV1().ConfigMaps(identity.Namespace).Create(ctx, cm, metav1.CreateOptions{})
 	if err == nil {
@@ -412,7 +417,7 @@ func (p *Provider) releaseShadowOfEndedPod(ctx context.Context, pod *v1.Pod) {
 		return
 	}
 	log.G(ctx).Infof("Pod %s/%s is %s: removing its shadow", pod.Namespace, pod.Name, pod.Status.Phase)
-	p.cleanupShadowResources(ctx, identity.Name, identity.Namespace)
+	p.cleanupShadowResources(ctx, identity)
 	p.forgetShadowNodeName(pod)
 }
 

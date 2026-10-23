@@ -81,3 +81,29 @@ func TestTenantNamespaceDefaultsToNoReplication(t *testing.T) {
 
 	assert.False(t, *config.Network.SSH.ReplicateCredentials)
 }
+
+func TestRefuseForeignPod(t *testing.T) {
+	foreign := tenantPod("bob")
+	foreign.Status.Phase = v1.PodPending
+	own := tenantPod(testTenantNamespace)
+	own.Name = "own"
+	client := fake.NewSimpleClientset(foreign, own)
+
+	require.NoError(t, refuseForeignPod(t.Context(), client, testTenantNamespace, foreign))
+	require.NoError(t, refuseForeignPod(t.Context(), client, testTenantNamespace, own))
+
+	got, err := client.CoreV1().Pods("bob").Get(t.Context(), foreign.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, v1.PodFailed, got.Status.Phase)
+	assert.Equal(t, tenantRefusedReason, got.Status.Reason)
+
+	got, err = client.CoreV1().Pods(testTenantNamespace).Get(t.Context(), own.Name, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, got.Status.Phase, "a pod of the tenant namespace is left alone")
+
+	// an unconfined node refuses nothing
+	other := tenantPod("carol")
+	client = fake.NewSimpleClientset(other)
+	require.NoError(t, refuseForeignPod(t.Context(), client, "", other))
+	assert.Empty(t, client.Actions())
+}
