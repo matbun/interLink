@@ -193,10 +193,6 @@ func (p *Provider) shadowResourceIdentity(pod *v1.Pod) (shadowResourceIdentity, 
 	return shadowResourceIdentityFor(pod, p.shadowInPodNamespace(pod))
 }
 
-func computeShadowResourceIdentity(pod *v1.Pod) (shadowResourceIdentity, error) {
-	return shadowResourceIdentityFor(pod, isShadowSameNamespace(pod))
-}
-
 func shadowResourceIdentityFor(pod *v1.Pod, sameNamespace bool) (shadowResourceIdentity, error) {
 	if pod == nil {
 		return shadowResourceIdentity{}, fmt.Errorf("pod is nil")
@@ -217,7 +213,7 @@ func shadowResourceIdentityFor(pod *v1.Pod, sameNamespace bool) (shadowResourceI
 		OwnerUID: string(pod.UID), PodName: pod.Name, PodNamespace: pod.Namespace,
 	}
 	if len(fmt.Sprintf("%s-%s", identity.Name, identity.Namespace)) > 63 {
-		return shadowResourceIdentity{}, fmt.Errorf("shadow ingress hostname label %q exceeds 63 characters; shorten pod/namespace or disable interlink.eu/shadow-same-ns", fmt.Sprintf("%s-%s", identity.Name, identity.Namespace))
+		return shadowResourceIdentity{}, fmt.Errorf("shadow ingress hostname label %q exceeds 63 characters; shorten the pod or namespace name, or, on a node not confined to one namespace, disable interlink.eu/shadow-same-ns", fmt.Sprintf("%s-%s", identity.Name, identity.Namespace))
 	}
 
 	return identity, nil
@@ -462,6 +458,13 @@ func (p *Provider) releaseShadowOfEndedPod(ctx context.Context, pod *v1.Pod) {
 		return
 	}
 	log.G(ctx).Infof("Pod %s/%s is %s: removing its shadow", pod.Namespace, pod.Name, pod.Status.Phase)
+	// Their logs go with the shadow: keep the last ones, sidecars and kept containers
+	// included, which were still running when the init containers' logs were saved.
+	if kept := append(getLocalInitContainers(pod), getLocalContainers(pod)...); len(kept) > 0 {
+		if shadow, err := p.currentShadowPod(ctx, identity); err == nil && shadow != nil {
+			p.saveKeptLogs(ctx, string(pod.UID), shadow, kept)
+		}
+	}
 	p.cleanupShadowResources(ctx, identity)
 	p.forgetShadowNodeName(pod)
 }

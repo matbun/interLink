@@ -220,8 +220,9 @@ type Provider struct {
 	// shadowLocks serialise applying a shadow's manifests and cleaning them up, per
 	// shadow name (see lockShadow).
 	shadowLocks [64]sync.Mutex
-	// keptInitLogs holds, per pod UID, the logs of the init containers the pod kept on
-	// the cluster (map[string][]byte by container name), read when they ended.
+	// keptInitLogs holds, per pod UID, the logs of the containers the pod kept on the
+	// cluster (map[string][]byte by container name), read when its kept init containers
+	// ended and again before its shadow is removed.
 	keptInitLogs     sync.Map
 	pendingDeletes   map[string]*pendingDelete
 	pendingDeletesMu sync.Mutex
@@ -1541,6 +1542,9 @@ func (p *Provider) applyShadowObjects(ctx context.Context, manifestYAML string, 
 	return deploymentName, namespace, nil
 }
 
+// shadowPodWaitTimeout bounds waitForDeploymentPod.
+var shadowPodWaitTimeout = 30 * time.Second
+
 // waitForDeploymentPod waits for a deployment to create a pod and returns it.
 //
 // A pod recreated under the same name (a StatefulSet replica) gets a Deployment with the
@@ -1550,10 +1554,9 @@ func (p *Provider) applyShadowObjects(ctx context.Context, manifestYAML string, 
 // pods labelled for another pod than podUID: when the recreated pod takes the
 // Deployment over in place, the previous pod's shadow pod is newer than it.
 func (p *Provider) waitForDeploymentPod(ctx context.Context, deploymentName, namespace, podUID string) (*v1.Pod, error) {
-	timeout := 30 * time.Second
 	start := time.Now()
 
-	for time.Since(start) < timeout {
+	for time.Since(start) < shadowPodWaitTimeout {
 		deployment, err := p.clientSet.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
 		if err != nil {
 			log.G(ctx).Warningf("Failed to get deployment %s: %v", deploymentName, err)

@@ -310,6 +310,19 @@ func TestWaitForKeptInitContainers(t *testing.T) {
 		<-done
 	})
 
+	// DeletePod can take the wait over while the logs are being saved, after the init
+	// container completed: the wait must then not submit the pod.
+	t.Run("not submitted when DeletePod took the wait over after it completed", func(t *testing.T) {
+		pod := podKeepingInit(v1.RestartPolicyNever)
+		client := fake.NewSimpleClientset(shadowOf(t, pod, exited(0)))
+		p := keptProvider(client, pod)
+
+		ctx := p.trackKeptInitWait(t.Context(), pod)
+		p.keptInitWaits.Delete(string(pod.UID))
+
+		assert.ErrorIs(t, p.waitForKeptInitContainers(ctx, pod), errPodGoneWhileInitializing)
+	})
+
 	t.Run("no kept init container: nothing to wait for", func(t *testing.T) {
 		pod := podKeepingInit(v1.RestartPolicyNever)
 		delete(pod.Annotations, annDisableOffloadInitContainers)
@@ -381,6 +394,28 @@ func TestKeptContainerLogs(t *testing.T) {
 		require.NoError(t, p.waitForKeptInitContainers(p.trackKeptInitWait(t.Context(), pod), pod))
 		require.NoError(t, client.CoreV1().Pods(shadow.Namespace).Delete(t.Context(), shadow.Name, metav1.DeleteOptions{}))
 		assert.Equal(t, "fake logs", read(t, p, pod), "the shadow is gone, the saved log remains")
+	})
+
+	// A kept regular container, or a sidecar, is still running when the init containers'
+	// logs are saved: its log is saved again when the shadow of the ended pod goes.
+	t.Run("a kept container's log is kept when the shadow of the ended pod goes", func(t *testing.T) {
+		pod := podKeepingInit(v1.RestartPolicyNever)
+		pod.Annotations[annDisableOffloadContainers] = testAppName
+		pod.Status.Phase = v1.PodSucceeded
+		shadow := shadowOf(t, pod, exited(0))
+		client := fake.NewSimpleClientset(pod, shadow)
+		p := keptProvider(client, pod)
+		p.config.Network.EnableTunnel = true
+
+		p.releaseShadowOfEndedPod(t.Context(), pod)
+		require.NoError(t, client.CoreV1().Pods(shadow.Namespace).Delete(t.Context(), shadow.Name, metav1.DeleteOptions{}))
+
+		rc, err := p.GetLogs(t.Context(), pod.Namespace, pod.Name, testAppName, api.ContainerLogOpts{})
+		require.NoError(t, err, "the log of the kept container must outlive the shadow")
+		out, err := io.ReadAll(rc)
+		require.NoError(t, err)
+		require.NoError(t, rc.Close())
+		assert.Equal(t, "fake logs", string(out))
 	})
 
 	t.Run("no shadow and nothing saved", func(t *testing.T) {

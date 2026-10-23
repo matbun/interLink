@@ -311,13 +311,13 @@ func (p *Provider) waitForKeptInitContainers(ctx context.Context, pod *v1.Pod) e
 				}
 			}
 			if state.failed != nil && pod.Spec.RestartPolicy == v1.RestartPolicyNever {
-				p.saveKeptInitLogs(ctx, uid, shadow, kept)
+				p.saveKeptLogs(ctx, uid, shadow, kept)
 				p.failPodOnKeptInit(ctx, uid, state.failed)
 				return fmt.Errorf("init container %s kept on the cluster failed", state.failed.Name)
 			}
 			if state.done {
 				// Before the claim: taking the wait over cancels ctx.
-				p.saveKeptInitLogs(ctx, uid, shadow, kept)
+				p.saveKeptLogs(ctx, uid, shadow, kept)
 				if !p.stopKeptInitWait(uid) {
 					return errPodGoneWhileInitializing
 				}
@@ -337,17 +337,23 @@ func (p *Provider) waitForKeptInitContainers(ctx context.Context, pod *v1.Pod) e
 	}
 }
 
-// saveKeptInitLogs keeps the end of each kept init container's log, read from the
-// shadow once they ended: the shadow is removed when the pod ends, and with it the logs.
-func (p *Provider) saveKeptInitLogs(ctx context.Context, uid string, shadow *v1.Pod, kept []v1.Container) {
+// saveKeptLogs keeps the end of the log of each container the pod keeps on the
+// cluster, read from the shadow: the shadow is removed when the pod ends, and with it
+// the logs. A container whose log cannot be read keeps what was saved before.
+func (p *Provider) saveKeptLogs(ctx context.Context, uid string, shadow *v1.Pod, kept []v1.Container) {
 	tail := int64(keptInitLogLines)
 	saved := make(map[string][]byte, len(kept))
+	if previous, ok := p.keptInitLogs.Load(uid); ok {
+		for name, raw := range previous.(map[string][]byte) {
+			saved[name] = raw
+		}
+	}
 	for _, c := range kept {
 		raw, err := p.clientSet.CoreV1().Pods(shadow.Namespace).GetLogs(shadow.Name, &v1.PodLogOptions{
 			Container: c.Name, TailLines: &tail,
 		}).DoRaw(ctx)
 		if err != nil {
-			log.G(ctx).Warningf("Failed to read the log of init container %s in %s/%s: %v", c.Name, shadow.Namespace, shadow.Name, err)
+			log.G(ctx).Warningf("Failed to read the log of container %s in %s/%s: %v", c.Name, shadow.Namespace, shadow.Name, err)
 			continue
 		}
 		saved[c.Name] = raw

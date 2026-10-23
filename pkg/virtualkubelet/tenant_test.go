@@ -2,6 +2,7 @@ package virtualkubelet
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,8 +62,10 @@ func TestShadowInPodNamespaceNeedsNoNamespaceAccess(t *testing.T) {
 	config := sshConfig()
 	config.TenantNamespace = testTenantNamespace
 	p := &Provider{clientSet: client, config: normalized(t, config)}
+	shadowPodWaitTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { shadowPodWaitTimeout = 30 * time.Second })
 
-	// It fails later on the missing credential; only the calls made up to then matter.
+	// It fails later, when no shadow pod appears; only the calls made up to then matter.
 	_, _, err := p.createShadowPod(t.Context(), tenantPod(testTenantNamespace))
 
 	require.Error(t, err)
