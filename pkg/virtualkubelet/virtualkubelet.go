@@ -37,7 +37,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/clientcmd"
@@ -437,7 +436,6 @@ const defaultEphemeralStorage = "1Ti"
 func GetResources(config Config) v1.ResourceList {
 	gpuCount := map[string]resource.Quantity{}
 	fpgaCount := map[string]resource.Quantity{}
-	otherCount := map[string]resource.Quantity{}
 
 	for _, accelerator := range config.Resources.Accelerators {
 		switch accelerator.ResourceType {
@@ -451,13 +449,6 @@ func GetResources(config Config) v1.ResourceList {
 			existing := fpgaCount[accelerator.ResourceType]
 			existing.Add(q)
 			fpgaCount[accelerator.ResourceType] = existing
-		default:
-			// Any other extended resource, such as the GPUs of a remote site offered
-			// under a name of their own (LoadConfig checks the name).
-			q := resource.MustParse(accelerator.Available)
-			existing := otherCount[accelerator.ResourceType]
-			existing.Add(q)
-			otherCount[accelerator.ResourceType] = existing
 		}
 	}
 
@@ -479,12 +470,6 @@ func GetResources(config Config) v1.ResourceList {
 	}
 
 	for resourceType, q := range fpgaCount {
-		if !q.IsZero() {
-			resourceList[v1.ResourceName(resourceType)] = q
-		}
-	}
-
-	for resourceType, q := range otherCount {
 		if !q.IsZero() {
 			resourceList[v1.ResourceName(resourceType)] = q
 		}
@@ -730,9 +715,6 @@ func LoadConfig(ctx context.Context, providerConfig string) (config Config, err 
 		if _, err = resource.ParseQuantity(accelerator.Available); err != nil {
 			return config, fmt.Errorf("invalid value for accelerator %v (model: %v): %v", accelerator.ResourceType, accelerator.Model, err)
 		}
-		if !isExtendedResourceName(accelerator.ResourceType) {
-			return config, fmt.Errorf("invalid accelerator resource type %q: want a domain-qualified name outside kubernetes.io, such as example.com/gpu", accelerator.ResourceType)
-		}
 	}
 
 	return config, nil
@@ -830,16 +812,6 @@ func (p *Provider) nodeUpdate(ctx context.Context) {
 // Ping the kubelet from the cluster, this will always be ok by design probably
 func (p *Provider) Ping(_ context.Context) error {
 	return nil
-}
-
-// isExtendedResourceName reports whether name can be advertised as an extended
-// resource: a qualified name with a domain prefix outside kubernetes.io.
-func isExtendedResourceName(name string) bool {
-	prefix, _, found := strings.Cut(name, "/")
-	if !found || prefix == "kubernetes.io" || strings.HasSuffix(prefix, ".kubernetes.io") {
-		return false
-	}
-	return len(validation.IsQualifiedName(name)) == 0
 }
 
 // updateNodeResources updates the node's Capacity and Allocatable based on the resource
