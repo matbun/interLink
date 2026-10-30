@@ -38,6 +38,20 @@ func main() {
 		panic(err)
 	}
 
+	// ESTIMATE
+	estimateOp, err := reflector.NewOperationContext(http.MethodPost, "/estimate")
+	if err != nil {
+		panic(err)
+	}
+
+	estimateOp.AddReqStructure(new(interlink.EstimateRequest))
+	estimateOp.AddRespStructure(new(interlink.EstimateResponse), func(cu *openapi.ContentUnit) { cu.HTTPStatus = http.StatusOK })
+
+	err = reflector.AddOperation(estimateOp)
+	if err != nil {
+		panic(err)
+	}
+
 	// DELETE
 	deleteOp, err := reflector.NewOperationContext(http.MethodPost, "/delete")
 	if err != nil {

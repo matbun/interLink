@@ -101,6 +101,32 @@ type RetrievedPodData struct {
 	JobScript string `json:"jobScript,omitempty"`
 }
 
+// EstimateRequest asks the plugin when the remote system would start a job of this shape
+// if it were submitted now, so that a caller can hold the job back while the start is far.
+// interLink sends it unchanged to the plugin's /estimate.
+type EstimateRequest struct {
+	// Nodes is the number of nodes of the job, at least 1
+	Nodes int `json:"nodes"`
+	// GPUsPerNode is the number of GPUs the job needs on each node
+	GPUsPerNode int `json:"gpusPerNode"`
+	// CPUsPerNode is the number of CPUs the job needs on each node, when the caller knows it
+	CPUsPerNode int `json:"cpusPerNode,omitempty"`
+	// Time is the time limit of the job (HH:MM:SS), when it has one
+	Time string `json:"time,omitempty"`
+	// Flags are the job's own scheduler options in the plugin's syntax, such as the account
+	// and queue it was admitted to, as its pods would carry them (for the Slurm plugin, sbatch
+	// flags as in the slurm-job.vk.io/flags annotation)
+	Flags string `json:"flags,omitempty"`
+}
+
+// EstimateResponse is the plugin's answer to /estimate.
+type EstimateResponse struct {
+	// Start is when the remote system expects to start the job
+	Start time.Time `json:"start"`
+	// Raw is the remote system's own answer, as text
+	Raw string `json:"raw"`
+}
+
 // ContainerLogOpts specifies options for retrieving container logs from sidecar plugins.
 // These options control how logs are fetched, filtered, and formatted, matching
 // Kubernetes' standard log retrieval parameters.

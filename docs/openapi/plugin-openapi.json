@@ -166,6 +166,44 @@
           }
         }
       }
+    },
+    "/estimate": {
+      "post": {
+        "summary": "Estimate",
+        "operationId": "estimate_estimate_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EstimateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EstimateResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -539,6 +577,58 @@
         },
         "type": "object",
         "title": "EnvVarSource"
+      },
+      "EstimateRequest": {
+        "properties": {
+          "nodes": {
+            "type": "integer",
+            "title": "Nodes"
+          },
+          "gpusPerNode": {
+            "type": "integer",
+            "title": "Gpuspernode",
+            "default": 0
+          },
+          "cpusPerNode": {
+            "type": "integer",
+            "title": "Cpuspernode",
+            "default": 0
+          },
+          "time": {
+            "type": "string",
+            "title": "Time",
+            "default": ""
+          },
+          "flags": {
+            "type": "string",
+            "title": "Flags",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "nodes"
+        ],
+        "title": "EstimateRequest"
+      },
+      "EstimateResponse": {
+        "properties": {
+          "start": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start"
+          },
+          "raw": {
+            "type": "string",
+            "title": "Raw"
+          }
+        },
+        "type": "object",
+        "required": [
+          "start",
+          "raw"
+        ],
+        "title": "EstimateResponse"
       },
       "HTTPValidationError": {
         "properties": {
