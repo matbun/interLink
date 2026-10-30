@@ -151,25 +151,28 @@ Retrieves logs from a specific container.
 **Query Parameters**: Pod UID, container name, log options **Response**:
 Container logs (plain text)
 
-### POST /createPodGroup (optional)
+### POST /estimate (optional)
 
-Creates the pods of one pod group as a single job. A plugin that implements it
-lists `pod-group-create` in the `capabilities` of its ping answer, and it is
-used only then; status, logs and delete stay per pod.
+Answers when the remote system would start a job of the given shape if it were
+submitted now, so that a caller can hold the job back while the start is far. A
+plugin that implements it lists `estimate` in the `capabilities` of its ping
+answer, and it is used only then. interLink forwards the body unchanged.
 
-**Request Body**: `RetrievedPodGroupData` **Response**: `List[CreateStruct]`,
-one per pod in the order of the request, all with the job ID of the group
+**Request Body**: `EstimateRequest` **Response**: `EstimateResponse`
 
 ```json
-{
-  "groupUID": "workload-uid",
-  "pods": [...]  // each pod as sent to /create, in rank order
-}
+{ "nodes": 2, "gpusPerNode": 4, "cpusPerNode": 80, "time": "01:30:00", "flags": "--qos=debug" }
 ```
 
-The order of the pods gives their ranks; rank 0 is the head. Answer 400 with a
-text body for a bad request or a permanent refusal, and 503 when the group
-cannot be taken now.
+```json
+{ "start": "2026-10-30T14:00:00Z", "raw": "the system's own answer" }
+```
+
+`nodes` is at least 1; `cpusPerNode`, `time` (the job's time limit,
+`HH:MM:SS`) and `flags` (the job's own scheduler options in the plugin's syntax,
+such as the account and queue it was admitted to) are optional. Answer 400 with a text body for a bad request, and
+another error code with the system's own message in the body when it gives no
+start time (for instance when a per-user limit on submitted jobs is reached).
 
 ## Developing with the Python SDK
 
