@@ -343,6 +343,7 @@ spec:
 **Behavior:**
 - The virtual kubelet adds the names to the container's `/etc/hosts` and waits for the tunnel before the workload starts
 - A Service FQDN also resolves as `name.namespace.svc` and `name.namespace`, and as `name` in the pod's own namespace
+- A bare name such as `minio` is a Service in the pod's own namespace: the job uses `minio`, and the shadow, which usually runs in another namespace, connects to `minio.<namespace>`
 - An entry that does not parse, or a listen port below 1024, is refused when the pod is created
 - Needs `Network.SSH.Reverse.Enabled: true` and no `interlink.eu/pod-vpn` on the pod; otherwise the pod is refused rather than run without its tunnel
 - Needs a plugin that gives the job a socket directory (`SocketDirRoot` in the Slurm plugin); otherwise the job fails at start
@@ -374,6 +375,7 @@ metadata:
 - Pod creation is refused unless the virtual kubelet sets `Network.SSH.Reverse.AllowSocks: true`; when it does, the pod gets a `ReverseSocksProxy` warning event
 - A plain listener on `127.0.0.1`, with no owner check: every user of the compute node can use it
 - Two pods on one compute node cannot use the same port; the job fails at start when another user already listens on it, and the shadow's tunnel fails when another pod of the same account does
+- The job also fails at start when the node's sshd sets `GatewayPorts yes`, which binds the proxy on every address of the node instead of `127.0.0.1`
 - Must be above 1023 and not clash with a forward's listen port
 
 **Default:** Not set (no proxy)

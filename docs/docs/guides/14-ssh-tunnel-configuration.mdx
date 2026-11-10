@@ -796,7 +796,8 @@ to the node's sshd from `127.0.0.1`. On top of that:
 - **Remote forwarding to a unix socket on the compute node's sshd**,
   `AllowStreamLocalForwarding yes` (the default) or `remote`, in both forward modes. A
   [SOCKS proxy](#endpoints-not-known-in-advance) also needs `AllowTcpForwarding yes`
-  or `remote` there.
+  or `remote` there, and `GatewayPorts` other than `yes`, which would bind it on every
+  address of the node.
 - **A socket directory** from the plugin: `SocketDirRoot` in the Slurm plugin, see
   [The socket directory](#the-socket-directory). The relay and the sockets live there.
 - **`python3` on the compute nodes** (`Reverse.PythonPath`), which runs the relay. It is
@@ -1053,6 +1054,11 @@ it: report it to the site. Without that line, check `Reverse.PythonPath`.
 **`interLink: another user listens on the SOCKS port` in the job log.** Another user
 holds `127.0.0.1:<port>` on the compute node. Pick another
 `interlink.eu/reverse-socks-port`.
+
+**`interLink: the SOCKS proxy listens on every address of the node` in the job log.**
+The node's sshd sets `GatewayPorts yes`, so the proxy would be open to other machines,
+and the job fails rather than run with it. Ask the site for `GatewayPorts no` or
+`clientspecified` for the account, or drop `interlink.eu/reverse-socks-port`.
 
 **Pod creation fails with `interlink.eu/reverse-forwards: ...`.** The annotation did
 not parse; the message names the entry and what is wrong with it.
