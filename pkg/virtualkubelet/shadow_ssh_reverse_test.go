@@ -28,6 +28,8 @@ const (
 	reverseTestNamespace = "user"
 	reverseTestService   = "minio.user.svc.cluster.local"
 	reverseTestForward   = "minio.user.svc:9000"
+	reverseTestAPIServer = "kubernetes.default.svc.cluster.local"
+	reverseTestBindError = "127.x.y.z"
 	reverseTestPodVPN    = "interlink.eu/pod-vpn"
 	reverseTestBind      = "127.77.1.2"
 	reverseTestUID       = "0d9b2d4a-6f6e-4a5f-9a66-2c1c5a4e9f10"
@@ -59,7 +61,7 @@ func TestParseReverseTunnel(t *testing.T) {
 		pod := reversePod(map[string]string{annReverseForwards: reverseTestService + ":9000"})
 		rt, err := parseReverseTunnel(pod, cfg)
 		assert.NoError(t, err)
-		assert.Equal(t, []ReverseForward{{ListenPort: 9000, Host: reverseTestService, Port: 9000}}, rt.Forwards)
+		assert.Equal(t, []ReverseForward{{ListenPort: 9000, Host: reverseTestService, Port: 9000, Dial: reverseTestService}}, rt.Forwards)
 		assert.Zero(t, rt.SocksPort, "SOCKS is off unless asked for")
 		assert.Equal(t, SSHReverseNodeExecSSH, rt.NodeExec)
 		assert.Equal(t, SSHReverseSshdNode, rt.Sshd)
@@ -77,11 +79,23 @@ func TestParseReverseTunnel(t *testing.T) {
 		rt, err := parseReverseTunnel(pod, cfg)
 		assert.NoError(t, err)
 		assert.Equal(t, []ReverseForward{
-			{ListenPort: 6443, Host: "kubernetes.default.svc.cluster.local", Port: 443},
-			{ListenPort: 6379, Host: "redis.user.svc", Port: 6379},
+			{ListenPort: 6443, Host: reverseTestAPIServer, Port: 443, Dial: reverseTestAPIServer},
+			{ListenPort: 6379, Host: "redis.user.svc", Port: 6379, Dial: "redis.user.svc"},
 		}, rt.Forwards)
 		assert.Equal(t, int32(1080), rt.SocksPort)
 		assert.Equal(t, reverseTestBind, rt.Bind)
+	})
+
+	// The shadow lives in <namespace>-shadow unless shadow-same-ns is set, where a
+	// bare name would resolve to another Service or to nothing.
+	t.Run("a bare Service name is dialled in the pod's namespace", func(t *testing.T) {
+		pod := reversePod(map[string]string{annReverseForwards: "minio:9000 localhost:2222"})
+		rt, err := parseReverseTunnel(pod, cfg)
+		assert.NoError(t, err)
+		assert.Equal(t, []ReverseForward{
+			{ListenPort: 9000, Host: "minio", Port: 9000, Dial: "minio." + reverseTestNamespace},
+			{ListenPort: 2222, Host: "localhost", Port: 2222, Dial: "localhost"},
+		}, rt.Forwards, "the job keeps the name it asked for, the shadow dials the qualified one")
 	})
 
 	t.Run("the removed owner-only and node-exec annotations are ignored", func(t *testing.T) {
@@ -106,8 +120,9 @@ func TestParseReverseTunnel(t *testing.T) {
 		{"two forwards on one listen port", map[string]string{annReverseForwards: "a.user.svc:9000 9000:b.user.svc:9001"}, "both listen on port 9000"},
 		{"socks on a forward's port", map[string]string{annReverseForwards: "a.user.svc:9000", annReverseSocksPort: "9000"}, "already used"},
 		{"socks on a privileged port", map[string]string{annReverseSocksPort: "80"}, "below 1024"},
-		{"bind outside loopback", map[string]string{annReverseSocksPort: reverseTestSocks, annReverseBind: "10.0.0.1"}, "127.x.y.z"},
-		{"bind on the shared loopback address", map[string]string{annReverseSocksPort: reverseTestSocks, annReverseBind: "127.0.0.1"}, "127.x.y.z"},
+		{"bind outside loopback", map[string]string{annReverseSocksPort: reverseTestSocks, annReverseBind: "10.0.0.1"}, reverseTestBindError},
+		{"bind on the shared loopback address", map[string]string{annReverseSocksPort: reverseTestSocks, annReverseBind: "127.0.0.1"}, reverseTestBindError},
+		{"bind on the shared loopback address, IPv4-mapped", map[string]string{annReverseSocksPort: reverseTestSocks, annReverseBind: "::ffff:127.0.0.1"}, reverseTestBindError},
 	}
 	for _, tt := range rejected {
 		t.Run("rejects "+tt.name, func(t *testing.T) {
@@ -116,6 +131,35 @@ func TestParseReverseTunnel(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantErr)
 		})
 	}
+}
+
+// TestReverseSocksOwner runs the SOCKS readiness check on made-up /proc/net/tcp
+// and tcp6 tables. Port 1080 is 0438.
+func TestReverseSocksOwner(t *testing.T) {
+	awk, err := exec.LookPath("awk")
+	if err != nil {
+		t.Skip("awk not found")
+	}
+	const header = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+	listener := func(addr, uid string) string {
+		return "   0: " + addr + ":0438 " + strings.Repeat("0", len(addr)) + ":0000 0A 00000000:00000000 00:00000000 00000000  " + uid + "        0 1 1\n"
+	}
+	owner := func(tcp, tcp6 string) string {
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "tcp"), []byte(header+tcp), 0o600))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "tcp6"), []byte(header+tcp6), 0o600))
+		out, err := exec.Command(awk, "-v", "p=:0438", "-v", "u=1000", reverseSocksOwnerAwk, // #nosec G204 -- fixed test input
+			filepath.Join(dir, "tcp"), filepath.Join(dir, "tcp6")).Output()
+		require.NoError(t, err)
+		return strings.TrimSpace(string(out))
+	}
+
+	assert.Empty(t, owner("", ""), "not listening yet")
+	assert.Equal(t, "own", owner(listener("0100007F", "1000"), ""))
+	assert.Equal(t, "other", owner(listener("0100007F", "1001"), ""))
+	assert.Equal(t, "open", owner(listener("00000000", "1000"), ""), "GatewayPorts yes binds every address")
+	assert.Equal(t, "open", owner("", listener(strings.Repeat("0", 32), "1000")), "and on IPv6 too")
+	assert.Equal(t, "other", owner(listener("00000000", "1001"), ""))
 }
 
 func TestReverseBindAddress(t *testing.T) {
@@ -175,7 +219,8 @@ func TestReversePreExec(t *testing.T) {
 	assertBashParses(t, script)
 
 	socksOnly := reversePreExec(&ReverseTunnel{SocksPort: 1080, Bind: reverseTestBind, PythonPath: DefaultSSHReversePythonPath}, reverseTestNamespace)
-	assert.Contains(t, socksOnly, `until [ "$(il_rev_owner 0438)" = own ]; do`, "wait for the job user's own listener on 1080")
+	assert.Contains(t, socksOnly, `until il_rev_s=$(il_rev_owner 0438); [ "$il_rev_s" = own ]; do`, "wait for the job user's own listener on 1080")
+	assert.Contains(t, socksOnly, "its sshd sets GatewayPorts", "a SOCKS proxy on every address of the node fails the job")
 	assert.Contains(t, socksOnly, "another user listens on the SOCKS port")
 	assert.NotContains(t, socksOnly, "/etc/hosts", "nothing to name without forwards")
 	assert.NotContains(t, socksOnly, "rev-relay.py", "no relay without forwards")
@@ -326,7 +371,10 @@ func TestUsesNodeHopsWithReverse(t *testing.T) {
 func reverseTunnelFor(config Config) *ReverseTunnel {
 	r := config.Network.SSH.Reverse
 	return &ReverseTunnel{
-		Forwards:   []ReverseForward{{ListenPort: 9000, Host: reverseTestService, Port: 9000}, {ListenPort: 6443, Host: "kubernetes.default.svc.cluster.local", Port: 443}},
+		Forwards: []ReverseForward{
+			{ListenPort: 9000, Host: reverseTestService, Port: 9000, Dial: reverseTestService},
+			{ListenPort: 6443, Host: reverseTestAPIServer, Port: 443, Dial: reverseTestAPIServer},
+		},
 		Bind:       reverseTestBind,
 		NodeExec:   r.NodeExec,
 		Sshd:       r.Sshd,

@@ -721,7 +721,7 @@ spec:
             done
         env:
         - name: REV_FORWARDS
-          value: "{{range $i, $f := .Reverse.Forwards}}{{if $i}} {{end}}{{$f.ListenPort}}:{{$f.Host}}:{{$f.Port}}{{end}}"
+          value: "{{range $i, $f := .Reverse.Forwards}}{{if $i}} {{end}}{{$f.ListenPort}}:{{$f.Dial}}:{{$f.Port}}{{end}}"
         - name: REV_SOCKS_PORT
           value: "{{if .Reverse.SocksPort}}{{.Reverse.SocksPort}}{{end}}"
         - name: REV_NODE_EXEC

@@ -72,6 +72,9 @@ type ReverseForward struct {
 	ListenPort int32
 	Host       string
 	Port       int32
+	// Dial is what the shadow connects to: Host, qualified with the pod's namespace
+	// when it is a bare Service name (see reverseDialHost).
+	Dial string
 }
 
 // ReverseTunnel carries the pod's reverse settings into the ssh shadow template.
@@ -166,6 +169,7 @@ func parseReverseTunnel(pod *v1.Pod, cfg SSHReverse) (*ReverseTunnel, error) {
 			return nil, fmt.Errorf("%s: %q and %q both listen on port %d", annReverseForwards, other, spec, f.ListenPort)
 		}
 		listening[f.ListenPort] = spec
+		f.Dial = reverseDialHost(f.Host, pod.Namespace)
 		rt.Forwards = append(rt.Forwards, f)
 	}
 
@@ -185,7 +189,7 @@ func parseReverseTunnel(pod *v1.Pod, cfg SSHReverse) (*ReverseTunnel, error) {
 
 	if v := strings.TrimSpace(ann[annReverseBind]); v != "" {
 		ip := net.ParseIP(v).To4()
-		if ip == nil || ip[0] != 127 || v == "127.0.0.1" {
+		if ip == nil || ip[0] != 127 || ip.Equal(net.IPv4(127, 0, 0, 1)) {
 			return nil, fmt.Errorf("%s: %q is not a 127.x.y.z address other than 127.0.0.1", annReverseBind, v)
 		}
 		rt.Bind = ip.String()
@@ -226,6 +230,17 @@ func parseReverseForward(spec string) (ReverseForward, error) {
 		return f, fmt.Errorf("%q: port %d is below %d, which an unprivileged sshd cannot bind on the compute node; use listen-port:host:port with a higher listen port", spec, f.ListenPort, reversePrivilegedPortLimit)
 	}
 	return f, nil
+}
+
+// reverseDialHost is the address the shadow connects to for a forward's host. The
+// shadow usually runs in another namespace than the pod, where a bare Service name
+// would resolve to another Service or to nothing, so it is qualified with the
+// pod's namespace, which is what the job means by it.
+func reverseDialHost(host, podNamespace string) string {
+	if strings.Contains(host, ".") || host == "localhost" {
+		return host
+	}
+	return host + "." + podNamespace
 }
 
 func parseReversePort(s string) (int32, error) {
@@ -287,6 +302,15 @@ export SINGULARITY_BIND="${SINGULARITY_BIND:+$SINGULARITY_BIND,}$il_rev_hosts:/e
 export APPTAINER_BIND="${il_rev_ab:+$il_rev_ab,}$il_rev_hosts:/etc/hosts"
 `
 
+// reverseSocksOwnerAwk reads /proc/net/tcp and tcp6 for the listener on port p
+// and prints "own" for the job user's on the loopback address, "open" for the job
+// user's on a wildcard address, as the node's sshd binds with GatewayPorts yes
+// whatever address -R asks for, and "other" for another user's.
+const reverseSocksOwnerAwk = `FNR > 1 && $4 == "0A" {
+  if ($2 == "0100007F"p || $2 == "00000000000000000000000001000000"p) { print ($8 == u ? "own" : "other"); exit }
+  if ($2 == "00000000"p || $2 == "00000000000000000000000000000000"p) { print ($8 == u ? "open" : "other"); exit }
+}`
+
 func reversePreExec(rt *ReverseTunnel, podNamespace string) string {
 	seen := map[string]bool{}
 	var hosts []string
@@ -336,12 +360,14 @@ func reversePreExec(rt *ReverseTunnel, podNamespace string) string {
 	}
 	if rt.SocksPort != 0 {
 		// Anyone on the node may bind 127.0.0.1 first: wait for the listener to be
-		// the job user's own, and fail if it is somebody else's.
+		// the job user's own, and fail if it is somebody else's, or if it is ours
+		// on every address of the node.
 		port := fmt.Sprintf("%04X", rt.SocksPort)
 		b.WriteString("il_rev_uid=$(id -u)\n")
-		b.WriteString(`il_rev_owner() { awk -v p=":$1" -v u="$il_rev_uid" 'NR>1 && $4=="0A" && ($2=="0100007F"p || $2=="00000000"p) {print ($8==u ? "own" : "other"); exit}' /proc/net/tcp; }` + "\n")
-		fmt.Fprintf(&b, "until [ \"$(il_rev_owner %s)\" = own ]; do\n", port)
-		fmt.Fprintf(&b, "  [ \"$(il_rev_owner %s)\" = other ] && { echo 'interLink: another user listens on the SOCKS port' >&2; exit 1; }\n", port)
+		fmt.Fprintf(&b, "il_rev_owner() { awk -v p=\":$1\" -v u=\"$il_rev_uid\" '%s' /proc/net/tcp /proc/net/tcp6 2>/dev/null; }\n", reverseSocksOwnerAwk)
+		fmt.Fprintf(&b, "until il_rev_s=$(il_rev_owner %s); [ \"$il_rev_s\" = own ]; do\n", port)
+		b.WriteString("  [ \"$il_rev_s\" = other ] && { echo 'interLink: another user listens on the SOCKS port' >&2; exit 1; }\n")
+		b.WriteString("  [ \"$il_rev_s\" = open ] && { echo 'interLink: the SOCKS proxy listens on every address of the node, not on 127.0.0.1 only: its sshd sets GatewayPorts' >&2; exit 1; }\n")
 		b.WriteString("  " + timeout)
 		b.WriteString("  sleep 2\n")
 		b.WriteString("done\n")
